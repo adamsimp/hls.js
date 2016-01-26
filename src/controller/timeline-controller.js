@@ -17,11 +17,11 @@ class TimelineController {
       this.onmediadet0 = this.onMediaDetaching.bind(this);
       this.onud = this.onFragParsingUserData.bind(this);
       this.onfl = this.onFragLoaded.bind(this);
-      this.onml = this.onManifestLoading.bind(this);
+      this.onml = this.onManifestLoaded.bind(this);
       hls.on(Event.MEDIA_ATTACHING, this.onmediaatt0);
       hls.on(Event.MEDIA_DETACHING, this.onmediadet0);
       hls.on(Event.FRAG_PARSING_USERDATA, this.onud);
-      hls.on(Event.MANIFEST_LOADING, this.onml);
+      hls.on(Event.MANIFEST_LOADED, this.onml);
       hls.on(Event.FRAG_LOADED, this.onfl);
 
       this.cea708Interpreter = new CEA708Interpreter();
@@ -32,17 +32,35 @@ class TimelineController {
   }
 
   onMediaAttaching(event, data) {
-    var media = this.media = data.media;
-    this.cea708Interpreter.attach(media);
+    this.media = data.media;
+    this.cea708Interpreter.attach(this.media);
   }
 
   onMediaDetaching() {
     this.cea708Interpreter.detatch();
   }
 
-  onManifestLoading()
+  onManifestLoaded(event, data)
   {
     this.lastPts = Number.POSITIVE_INFINITY;
+
+    for (var i=0; i<data.textTracks.length; i++)
+    {
+      // TODO add tracks to media
+      var type = 'subtitles';
+
+      if (data.textTracks[i].type === 'CLOSED-CAPTIONS')
+      {
+        type = 'captions';
+      }
+
+      var track = this.media.addTextTrack(type, data.textTracks[i].name, data.textTracks[i].language);
+    }
+
+    this.media.textTracks.onchange = function(e)
+    {
+      // TODO: loop through text tracks and load any that are showing, but not loaded yet
+    }
   }
 
   onFragLoaded(event, data)

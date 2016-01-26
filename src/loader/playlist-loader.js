@@ -14,7 +14,8 @@ class PlaylistLoader extends EventHandler {
   constructor(hls) {
     super(hls,
       Event.MANIFEST_LOADING,
-      Event.LEVEL_LOADING);
+      Event.LEVEL_LOADING,
+      Event.TEXT_TRACK_LOADING);
   }
 
   destroy() {
@@ -32,6 +33,10 @@ class PlaylistLoader extends EventHandler {
 
   onLevelLoading(data) {
     this.load(data.url, data.level, data.id);
+  }
+
+  onTextTrackLoading(data) {
+    this.load(data.url, data.language, data.group);
   }
 
   load(url, id1, id2) {
@@ -62,8 +67,8 @@ class PlaylistLoader extends EventHandler {
   parseMasterPlaylist(string, baseurl) {
     var manifest = {};
 
-    manifest.levels = parseLevelsFromMasterPlaylist(string, baseurl);
-    manifest.textTracks = parseTextTracksFromMasterPlaylist(string, baseurl);
+    manifest.levels = this.parseLevelsFromMasterPlaylist(string, baseurl);
+    manifest.textTracks = this.parseTextTracksFromMasterPlaylist(string, baseurl);
 
     return manifest;
   }
@@ -109,37 +114,52 @@ class PlaylistLoader extends EventHandler {
     let tracks = [], result;
 
     // https://regex101.com is your friend
-    const re = /#EXT-X-STREAM-INF:([^\n\r]*)[\r\n]+([^\r\n]+)/g;
+    const re = /#EXT-X-MEDIA:([^\n\r]*)[\r\n]+([^\r\n]+)/g;
     while ((result = re.exec(string)) != null){
-      const level = {};
+      const track = {};
 
-      var attrs = level.attrs = new AttrList(result[1]);
-      level.url = this.resolve(result[2], baseurl);
+      var attrs = track.attrs = new AttrList(result[1]);
 
-      var resolution = attrs.decimalResolution('RESOLUTION');
-      if(resolution) {
-        level.width = resolution.width;
-        level.height = resolution.height;
-      }
-      level.bitrate = attrs.decimalInteger('BANDWIDTH');
-      level.name = attrs.NAME;
+      var type = attrs.TYPE;
+      var group = attrs['GROUP-ID'];
+      var name = attrs.NAME;
+      var defaultTrack = attrs.DEFAULT === "YES";
+      var lang = attrs.LANGUAGE;
+      var uri = attrs.URI;
 
-      var codecs = attrs.CODECS;
-      if(codecs) {
-        codecs = codecs.split(',');
-        for (let i = 0; i < codecs.length; i++) {
-          const codec = codecs[i];
-          if (codec.indexOf('avc1') !== -1) {
-            level.videoCodec = this.avc1toavcoti(codec);
-          } else {
-            level.audioCodec = codec;
-          }
-        }
+      if (type)
+      {
+        track.type = type;
       }
 
-      levels.push(level);
+      if (group)
+      {
+        track.group = group;
+      }
+
+      if (name)
+      {
+        track.name = name;
+      }
+
+      if (defaultTrack)
+      {
+        track.isDefault = defaultTrack;
+      }
+
+      if (lang)
+      {
+        track.language = lang;
+      }
+
+      if (uri)
+      {
+        track.uri = uri;
+      }
+
+      tracks.push(track);
     }
-    return levels;
+    return tracks;
   }  
 
   avc1toavcoti(codec) {
@@ -261,6 +281,10 @@ class PlaylistLoader extends EventHandler {
     return level;
   }
 
+  parseTextTrackPlaylist(string, baseurl, id) {
+    
+  }
+
   loadsuccess(event, stats) {
     var target = event.currentTarget,
         string = target.responseText,
@@ -293,7 +317,7 @@ class PlaylistLoader extends EventHandler {
         manifest = this.parseMasterPlaylist(string, url);
         // multi level playlist, parse level info
         if (manifest.levels.length) {
-          hls.trigger(Event.MANIFEST_LOADED, {levels: manifest.levels, url: url, stats: stats});
+          hls.trigger(Event.MANIFEST_LOADED, {levels: manifest.levels, textTracks: manifest.textTracks, url: url, stats: stats});
         } else {
           hls.trigger(Event.ERROR, {type: ErrorTypes.NETWORK_ERROR, details: ErrorDetails.MANIFEST_PARSING_ERROR, fatal: true, url: url, reason: 'no level found in manifest'});
         }
