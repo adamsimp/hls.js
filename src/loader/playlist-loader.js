@@ -60,6 +60,15 @@ class PlaylistLoader extends EventHandler {
   }
 
   parseMasterPlaylist(string, baseurl) {
+    var manifest = {};
+
+    manifest.levels = parseLevelsFromMasterPlaylist(string, baseurl);
+    manifest.textTracks = parseTextTracksFromMasterPlaylist(string, baseurl);
+
+    return manifest;
+  }
+
+  parseLevelsFromMasterPlaylist(string, baseurl) {
     let levels = [], result;
 
     // https://regex101.com is your friend
@@ -95,6 +104,43 @@ class PlaylistLoader extends EventHandler {
     }
     return levels;
   }
+
+  parseTextTracksFromMasterPlaylist(string, baseurl) {
+    let tracks = [], result;
+
+    // https://regex101.com is your friend
+    const re = /#EXT-X-STREAM-INF:([^\n\r]*)[\r\n]+([^\r\n]+)/g;
+    while ((result = re.exec(string)) != null){
+      const level = {};
+
+      var attrs = level.attrs = new AttrList(result[1]);
+      level.url = this.resolve(result[2], baseurl);
+
+      var resolution = attrs.decimalResolution('RESOLUTION');
+      if(resolution) {
+        level.width = resolution.width;
+        level.height = resolution.height;
+      }
+      level.bitrate = attrs.decimalInteger('BANDWIDTH');
+      level.name = attrs.NAME;
+
+      var codecs = attrs.CODECS;
+      if(codecs) {
+        codecs = codecs.split(',');
+        for (let i = 0; i < codecs.length; i++) {
+          const codec = codecs[i];
+          if (codec.indexOf('avc1') !== -1) {
+            level.videoCodec = this.avc1toavcoti(codec);
+          } else {
+            level.audioCodec = codec;
+          }
+        }
+      }
+
+      levels.push(level);
+    }
+    return levels;
+  }  
 
   avc1toavcoti(codec) {
     var result, avcdata = codec.split('.');
@@ -222,7 +268,7 @@ class PlaylistLoader extends EventHandler {
         id = this.id,
         id2 = this.id2,
         hls = this.hls,
-        levels;
+        manifest;
     // responseURL not supported on some browsers (it is used to detect URL redirection)
     if (url === undefined) {
       // fallback to initial URL
@@ -243,10 +289,11 @@ class PlaylistLoader extends EventHandler {
           hls.trigger(Event.LEVEL_LOADED, {details: levelDetails, level: id, id: id2, stats: stats});
         }
       } else {
-        levels = this.parseMasterPlaylist(string, url);
+
+        manifest = this.parseMasterPlaylist(string, url);
         // multi level playlist, parse level info
-        if (levels.length) {
-          hls.trigger(Event.MANIFEST_LOADED, {levels: levels, url: url, stats: stats});
+        if (manifest.levels.length) {
+          hls.trigger(Event.MANIFEST_LOADED, {levels: manifest.levels, url: url, stats: stats});
         } else {
           hls.trigger(Event.ERROR, {type: ErrorTypes.NETWORK_ERROR, details: ErrorDetails.MANIFEST_PARSING_ERROR, fatal: true, url: url, reason: 'no level found in manifest'});
         }
