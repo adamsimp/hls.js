@@ -33,7 +33,7 @@ var URLHelper = {
       baseURL = baseURLQuerySplit[1];
     }
 
-    var baseURLDomainSplit = /^((([a-z]+):)?\/\/[a-z0-9\.-]+(:[0-9]+)?\/)(.*)$/i.exec(baseURL);
+    var baseURLDomainSplit = /^((([a-z]+):)?\/\/[a-z0-9\.\-_~]+(:[0-9]+)?\/)(.*)$/i.exec(baseURL);
     var baseURLProtocol = baseURLDomainSplit[3];
     var baseURLDomain = baseURLDomainSplit[1];
     var baseURLPath = baseURLDomainSplit[5];
@@ -46,8 +46,7 @@ var URLHelper = {
       builtURL = baseURLDomain+URLHelper.buildAbsolutePath('', relativeURL.substring(1));
     }
     else {
-      var newPath = URLHelper.buildAbsolutePath(baseURLPath, relativeURL);
-      builtURL = baseURLDomain + newPath;
+      builtURL = URLHelper.buildAbsolutePath(baseURLDomain+baseURLPath, relativeURL);
     }
 
     // put the query and hash parts back

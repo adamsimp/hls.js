@@ -3,16 +3,15 @@
 */
 
 import Event from '../events';
+import EventHandler from '../event-handler';
 import {ErrorTypes, ErrorDetails} from '../errors';
 
-class KeyLoader {
+class KeyLoader extends EventHandler {
 
   constructor(hls) {
-    this.hls = hls;
+    super(hls, Event.KEY_LOADING);
     this.decryptkey = null;
     this.decrypturl = null;
-    this.ondkl = this.onDecryptKeyLoading.bind(this);
-    hls.on(Event.KEY_LOADING, this.ondkl);
   }
 
   destroy() {
@@ -20,10 +19,10 @@ class KeyLoader {
       this.loader.destroy();
       this.loader = null;
     }
-    this.hls.off(Event.KEY_LOADING, this.ondkl);
+    EventHandler.prototype.destroy.call(this);
   }
 
-  onDecryptKeyLoading(event, data) {
+  onKeyLoading(data) {
     var frag = this.frag = data.frag,
         decryptdata = frag.decryptdata,
         uri = decryptdata.uri;
@@ -50,12 +49,16 @@ class KeyLoader {
   }
 
   loaderror(event) {
-    this.loader.abort();
+    if (this.loader) {
+      this.loader.abort();
+    }
     this.hls.trigger(Event.ERROR, {type: ErrorTypes.NETWORK_ERROR, details: ErrorDetails.KEY_LOAD_ERROR, fatal: false, frag: this.frag, response: event});
   }
 
   loadtimeout() {
-    this.loader.abort();
+    if (this.loader) {
+      this.loader.abort();
+    }
     this.hls.trigger(Event.ERROR, {type: ErrorTypes.NETWORK_ERROR, details: ErrorDetails.KEY_LOAD_TIMEOUT, fatal: false, frag: this.frag});
   }
 

@@ -9,6 +9,7 @@
  * upon discontinuity or level switch detection, it will also notifies the remuxer so that it can reset its state.
 */
 
+ import ADTS from './adts';
  import Event from '../events';
  import ExpGolomb from './exp-golomb';
 // import Hex from '../utils/hex';
@@ -21,7 +22,6 @@
     this.observer = observer;
     this.remuxerClass = remuxerClass;
     this.lastCC = 0;
-    this.PES_TIMESCALE = 90000;
     this.remuxer = new this.remuxerClass(observer);
   }
 
@@ -37,9 +37,12 @@
   switchLevel() {
     this.pmtParsed = false;
     this._pmtId = -1;
-    this._avcTrack = {type: 'video', id :-1, sequenceNumber: 0, samples : [], len : 0, nbNalu : 0};
-    this._aacTrack = {type: 'audio', id :-1, sequenceNumber: 0, samples : [], len : 0};
+    this.lastAacPTS = null;
+    this.aacOverFlow = null;
+    this._avcTrack = {container : 'video/mp2t', type: 'video', id :-1, sequenceNumber: 0, samples : [], len : 0, nbNalu : 0};
+    this._aacTrack = {container : 'video/mp2t', type: 'audio', id :-1, sequenceNumber: 0, samples : [], len : 0};
     this._id3Track = {type: 'id3', id :-1, sequenceNumber: 0, samples : [], len : 0};
+    this._txtTrack = {type: 'text', id: -1, sequenceNumber: 0, samples: [], len: 0};
     this.remuxer.switchLevel();
   }
 
@@ -51,7 +54,9 @@
   // feed incoming data to the front of the parsing pipeline
   push(data, audioCodec, videoCodec, timeOffset, cc, level, sn, duration) {
     var avcData, aacData, id3Data,
-        start, len = data.length, stt, pid, atf, offset;
+        start, len = data.length, stt, pid, atf, offset,
+        codecsOnly = this.remuxer.passthrough;
+
     this.audioCodec = audioCodec;
     this.videoCodec = videoCodec;
     this.timeOffset = timeOffset;
@@ -79,6 +84,9 @@
         avcId = this._avcTrack.id,
         aacId = this._aacTrack.id,
         id3Id = this._id3Track.id;
+
+    // don't parse last TS packet if incomplete
+    len -= len % 188;
     // loop through TS packets
     for (start = 0; start < len; start += 188) {
       if (data[start] === 0x47) {
@@ -101,6 +109,15 @@
             if (stt) {
               if (avcData) {
                 this._parseAVCPES(this._parsePES(avcData));
+                if (codecsOnly) {
+                  // if we have video codec info AND
+                  // if audio PID is undefined OR if we have audio codec info,
+                  // we have all codec info !
+                  if (this._avcTrack.codec && (aacId === -1 || this._aacTrack.codec)) {
+                    this.remux(data);
+                    return;
+                  }
+                }
               }
               avcData = {data: [], size: 0};
             }
@@ -112,6 +129,15 @@
             if (stt) {
               if (aacData) {
                 this._parseAACPES(this._parsePES(aacData));
+                if (codecsOnly) {
+                  // here we now that we have audio codec info
+                  // if video PID is undefined OR if we have video codec info,
+                  // we have all codec infos !
+                  if (this._aacTrack.codec && (avcId === -1 || this._avcTrack.codec)) {
+                    this.remux(data);
+                    return;
+                  }
+                }
               }
               aacData = {data: [], size: 0};
             }
@@ -159,11 +185,11 @@
     if (id3Data) {
       this._parseID3PES(this._parsePES(id3Data));
     }
-    this.remux();
+    this.remux(null);
   }
 
-  remux() {
-    this.remuxer.remux(this._aacTrack,this._avcTrack, this._id3Track, this.timeOffset, this.contiguous);
+  remux(data) {
+    this.remuxer.remux(this._aacTrack, this._avcTrack, this._id3Track, this._txtTrack, this.timeOffset, this.contiguous, data);
   }
 
   destroy() {
@@ -216,9 +242,9 @@
   }
 
   _parsePES(stream) {
-    var i = 0, frag, pesFlags, pesPrefix, pesLen, pesHdrLen, pesData, pesPts, pesDts, payloadStartOffset;
+    var i = 0, frag, pesFlags, pesPrefix, pesLen, pesHdrLen, pesData, pesPts, pesDts, payloadStartOffset, data = stream.data;
     //retrieve PTS/DTS from first fragment
-    frag = stream.data[0];
+    frag = data[0];
     pesPrefix = (frag[0] << 16) + (frag[1] << 8) + frag[2];
     if (pesPrefix === 1) {
       pesLen = (frag[4] << 8) + frag[5];
@@ -254,16 +280,27 @@
       }
       pesHdrLen = frag[8];
       payloadStartOffset = pesHdrLen + 9;
-      // trim PES header
-      stream.data[0] = stream.data[0].subarray(payloadStartOffset);
+
       stream.size -= payloadStartOffset;
       //reassemble PES packet
       pesData = new Uint8Array(stream.size);
-      // reassemble the packet
-      while (stream.data.length) {
-        frag = stream.data.shift();
+      while (data.length) {
+        frag = data.shift();
+        var len = frag.byteLength;
+        if (payloadStartOffset) {
+          if (payloadStartOffset > len) {
+            // trim full frag if PES header bigger than frag
+            payloadStartOffset-=len;
+            continue;
+          } else {
+            // trim partial frag if PES header smaller than frag
+            frag = frag.subarray(payloadStartOffset);
+            len-=payloadStartOffset;
+            payloadStartOffset = 0;
+          }
+        }
         pesData.set(frag, i);
-        i += frag.byteLength;
+        i+=len;
       }
       return {data: pesData, pts: pesPts, dts: pesDts, len: pesLen};
     } else {
@@ -279,8 +316,10 @@
         debug = false,
         key = false,
         length = 0,
+        expGolombDecoder,
         avcSample,
-        push;
+        push,
+        i;
     // no NALu found
     if (units.length === 0 && samples.length > 0) {
       // append pes.data to previous NAL unit
@@ -296,6 +335,7 @@
     //free pes.data to save up some memory
     pes.data = null;
     var debugString = '';
+
     units.forEach(unit => {
       switch(unit.type) {
         //NDR
@@ -313,10 +353,83 @@
           }
           key = true;
           break;
+        //SEI
         case 6:
           push = true;
           if(debug) {
             debugString += 'SEI ';
+          }
+          unit.data = this.discardEPB(unit.data);
+          expGolombDecoder = new ExpGolomb(unit.data);
+
+          // skip frameType
+          expGolombDecoder.readUByte();
+
+          var payloadType = 0;
+          var payloadSize = 0;
+          var endOfCaptions = false;
+
+          while (!endOfCaptions && expGolombDecoder.bytesAvailable > 1) {
+            payloadType = 0;
+            do {
+                if (expGolombDecoder.bytesAvailable!==0) {
+                  payloadType += expGolombDecoder.readUByte();
+                }
+            } while (payloadType === 0xFF);
+
+            // Parse payload size.
+            payloadSize = 0;
+            do {
+                if (expGolombDecoder.bytesAvailable!==0) {
+                  payloadSize += expGolombDecoder.readUByte();
+                }
+            } while (payloadSize === 0xFF);
+
+            // TODO: there can be more than one payload in an SEI packet...
+            // TODO: need to read type and size in a while loop to get them all
+            if (payloadType === 4 && expGolombDecoder.bytesAvailable !== 0) {
+
+              endOfCaptions = true;
+
+              var countryCode = expGolombDecoder.readUByte();
+
+              if (countryCode === 181) {
+                var providerCode = expGolombDecoder.readUShort();
+
+                if (providerCode === 49) {
+                  var userStructure = expGolombDecoder.readUInt();
+
+                  if (userStructure === 0x47413934) {
+                    var userDataType = expGolombDecoder.readUByte();
+
+                    // Raw CEA-608 bytes wrapped in CEA-708 packet
+                    if (userDataType === 3) {
+                      var firstByte = expGolombDecoder.readUByte();
+                      var secondByte = expGolombDecoder.readUByte();
+
+                      var totalCCs = 31 & firstByte;
+                      var byteArray = [firstByte, secondByte];
+
+                      for (i = 0; i < totalCCs; i++) {
+                        // 3 bytes per CC
+                        byteArray.push(expGolombDecoder.readUByte());
+                        byteArray.push(expGolombDecoder.readUByte());
+                        byteArray.push(expGolombDecoder.readUByte());
+                      }
+
+                      this._insertSampleInOrder(this._txtTrack.samples, { type: 3, pts: pes.pts, bytes: byteArray });
+                    }
+                  }
+                }
+              }
+            }
+            else if (payloadSize < expGolombDecoder.bytesAvailable)
+            {
+              for (i = 0; i<payloadSize; i++)
+              {
+                expGolombDecoder.readUByte();
+              }
+            }
           }
           break;
         //SPS
@@ -326,16 +439,15 @@
             debugString += 'SPS ';
           }
           if(!track.sps) {
-            var expGolombDecoder = new ExpGolomb(unit.data);
+            expGolombDecoder = new ExpGolomb(unit.data);
             var config = expGolombDecoder.readSPS();
             track.width = config.width;
             track.height = config.height;
             track.sps = [unit.data];
-            track.timescale = this.remuxer.timescale;
-            track.duration = this.remuxer.timescale * this._duration;
+            track.duration = this._duration;
             var codecarray = unit.data.subarray(1, 4);
             var codecstring = 'avc1.';
-            for (var i = 0; i < 3; i++) {
+            for (i = 0; i < 3; i++) {
               var h = codecarray[i].toString(16);
               if (h.length < 2) {
                 h = '0' + h;
@@ -356,7 +468,7 @@
           }
           break;
         case 9:
-          push = true;
+          push = false;
           if(debug) {
             debugString += 'AUD ';
           }
@@ -387,6 +499,26 @@
     }
   }
 
+  _insertSampleInOrder(arr, data) {
+    var len = arr.length;
+    if (len > 0) {
+      if (data.pts >= arr[len-1].pts)
+      {
+        arr.push(data);
+      }
+      else {
+        for (var pos = len - 1; pos >= 0; pos--) {
+          if (data.pts < arr[pos].pts) {
+            arr.splice(pos, 0, data);
+            break;
+          }
+        }
+      }
+    }
+    else {
+      arr.push(data);
+    }
+  }
 
   _parseAVCNALu(array) {
     var i = 0, len = array.byteLength, value, overflow, state = 0;
@@ -412,7 +544,7 @@
         case 3:
           if( value === 0) {
             state = 3;
-          } else if (value === 1) {
+          } else if (value === 1 && i < len) {
             unitType = array[i] & 0x1f;
             //logger.log('find NALU @ offset:' + i + ',type:' + unitType);
             if (lastUnitStart) {
@@ -423,25 +555,24 @@
               // If NAL units are not starting right at the beginning of the PES packet, push preceding data into previous NAL unit.
               overflow  = i - state - 1;
               if (overflow) {
+                var track = this._avcTrack,
+                    samples = track.samples;
                 //logger.log('first NALU found with overflow:' + overflow);
-                if (this._avcTrack.samples.length) {
-                  var lastavcSample = this._avcTrack.samples[this._avcTrack.samples.length - 1];
-                  var lastUnit = lastavcSample.units.units[lastavcSample.units.units.length - 1];
-                  var tmp = new Uint8Array(lastUnit.data.byteLength + overflow);
+                if (samples.length) {
+                  var lastavcSample = samples[samples.length - 1],
+                      lastUnits = lastavcSample.units.units,
+                      lastUnit = lastUnits[lastUnits.length - 1],
+                      tmp = new Uint8Array(lastUnit.data.byteLength + overflow);
                   tmp.set(lastUnit.data, 0);
                   tmp.set(array.subarray(0, overflow), lastUnit.data.byteLength);
                   lastUnit.data = tmp;
                   lastavcSample.units.length += overflow;
-                  this._avcTrack.len += overflow;
+                  track.len += overflow;
                 }
               }
             }
             lastUnitStart = i;
             lastUnitType = unitType;
-            if (unitType === 1 || unitType === 5) {
-              // OPTI !!! if IDR/NDR unit, consider it is last NALu
-              i = len;
-            }
             state = 0;
           } else {
             state = 0;
@@ -459,25 +590,78 @@
     return units;
   }
 
+  /**
+   * remove Emulation Prevention bytes from a RBSP
+   */
+  discardEPB(data) {
+    var length = data.byteLength,
+        EPBPositions = [],
+        i = 1,
+        newLength, newData;
+
+    // Find all `Emulation Prevention Bytes`
+    while (i < length - 2) {
+      if (data[i] === 0 &&
+          data[i + 1] === 0 &&
+          data[i + 2] === 0x03) {
+        EPBPositions.push(i + 2);
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+
+    // If no Emulation Prevention Bytes were found just return the original
+    // array
+    if (EPBPositions.length === 0) {
+      return data;
+    }
+
+    // Create a new array to hold the NAL unit data
+    newLength = length - EPBPositions.length;
+    newData = new Uint8Array(newLength);
+    var sourceIndex = 0;
+
+    for (i = 0; i < newLength; sourceIndex++, i++) {
+      if (sourceIndex === EPBPositions[0]) {
+        // Skip this byte
+        sourceIndex++;
+        // Remove this position index
+        EPBPositions.shift();
+      }
+      newData[i] = data[sourceIndex];
+    }
+    return newData;
+  }
+
   _parseAACPES(pes) {
-    var track = this._aacTrack, aacSample, data = pes.data, config, adtsFrameSize, adtsStartOffset, adtsHeaderLen, stamp, nbSamples, len;
-    if (this.aacOverFlow) {
-      var tmp = new Uint8Array(this.aacOverFlow.byteLength + data.byteLength);
-      tmp.set(this.aacOverFlow, 0);
-      tmp.set(data, this.aacOverFlow.byteLength);
+    var track = this._aacTrack,
+        data = pes.data,
+        pts = pes.pts,
+        startOffset = 0,
+        duration = this._duration,
+        audioCodec = this.audioCodec,
+        aacOverFlow = this.aacOverFlow,
+        lastAacPTS = this.lastAacPTS,
+        config, frameLength, frameDuration, frameIndex, offset, headerLength, stamp, len, aacSample;
+    if (aacOverFlow) {
+      var tmp = new Uint8Array(aacOverFlow.byteLength + data.byteLength);
+      tmp.set(aacOverFlow, 0);
+      tmp.set(data, aacOverFlow.byteLength);
+      //logger.log(`AAC: append overflowing ${aacOverFlow.byteLength} bytes to beginning of new PES`);
       data = tmp;
     }
     // look for ADTS header (0xFFFx)
-    for (adtsStartOffset = 0, len = data.length; adtsStartOffset < len - 1; adtsStartOffset++) {
-      if ((data[adtsStartOffset] === 0xff) && (data[adtsStartOffset+1] & 0xf0) === 0xf0) {
+    for (offset = startOffset, len = data.length; offset < len - 1; offset++) {
+      if ((data[offset] === 0xff) && (data[offset+1] & 0xf0) === 0xf0) {
         break;
       }
     }
     // if ADTS header does not start straight from the beginning of the PES payload, raise an error
-    if (adtsStartOffset) {
+    if (offset) {
       var reason, fatal;
-      if (adtsStartOffset < len - 1) {
-        reason = `AAC PES did not start with ADTS header,offset:${adtsStartOffset}`;
+      if (offset < len - 1) {
+        reason = `AAC PES did not start with ADTS header,offset:${offset}`;
         fatal = false;
       } else {
         reason = 'no ADTS header found in AAC PES';
@@ -489,37 +673,48 @@
       }
     }
     if (!track.audiosamplerate) {
-      config = this._ADTStoAudioConfig(data, adtsStartOffset, this.audioCodec);
+      config = ADTS.getAudioConfig(this.observer,data, offset, audioCodec);
       track.config = config.config;
       track.audiosamplerate = config.samplerate;
       track.channelCount = config.channelCount;
       track.codec = config.codec;
-      track.timescale = this.remuxer.timescale;
-      track.duration = this.remuxer.timescale * this._duration;
+      track.duration = duration;
       logger.log(`parsed codec:${track.codec},rate:${config.samplerate},nb channel:${config.channelCount}`);
     }
-    nbSamples = 0;
-    while ((adtsStartOffset + 5) < len) {
+    frameIndex = 0;
+    frameDuration = 1024 * 90000 / track.audiosamplerate;
+
+    // if last AAC frame is overflowing, we should ensure timestamps are contiguous:
+    // first sample PTS should be equal to last sample PTS + frameDuration
+    if(aacOverFlow && lastAacPTS) {
+      var newPTS = lastAacPTS+frameDuration;
+      if(Math.abs(newPTS-pts) > 1) {
+        logger.log(`AAC: align PTS for overlapping frames by ${Math.round((newPTS-pts)/90)}`);
+        pts=newPTS;
+      }
+    }
+
+    while ((offset + 5) < len) {
+      // The protection skip bit tells us if we have 2 bytes of CRC data at the end of the ADTS header
+      headerLength = (!!(data[offset + 1] & 0x01) ? 7 : 9);
       // retrieve frame size
-      adtsFrameSize = ((data[adtsStartOffset + 3] & 0x03) << 11);
-      // byte 4
-      adtsFrameSize |= (data[adtsStartOffset + 4] << 3);
-      // byte 5
-      adtsFrameSize |= ((data[adtsStartOffset + 5] & 0xE0) >>> 5);
-      adtsHeaderLen = (!!(data[adtsStartOffset + 1] & 0x01) ? 7 : 9);
-      adtsFrameSize -= adtsHeaderLen;
-      stamp = Math.round(pes.pts + nbSamples * 1024 * this.PES_TIMESCALE / track.audiosamplerate);
+      frameLength = ((data[offset + 3] & 0x03) << 11) |
+                     (data[offset + 4] << 3) |
+                    ((data[offset + 5] & 0xE0) >>> 5);
+      frameLength  -= headerLength;
       //stamp = pes.pts;
-      //console.log('AAC frame, offset/length/pts:' + (adtsStartOffset+7) + '/' + adtsFrameSize + '/' + stamp.toFixed(0));
-      if ((adtsFrameSize > 0) && ((adtsStartOffset + adtsHeaderLen + adtsFrameSize) <= len)) {
-        aacSample = {unit: data.subarray(adtsStartOffset + adtsHeaderLen, adtsStartOffset + adtsHeaderLen + adtsFrameSize), pts: stamp, dts: stamp};
-        this._aacTrack.samples.push(aacSample);
-        this._aacTrack.len += adtsFrameSize;
-        adtsStartOffset += adtsFrameSize + adtsHeaderLen;
-        nbSamples++;
+
+      if ((frameLength > 0) && ((offset + headerLength + frameLength) <= len)) {
+        stamp = pts + frameIndex * frameDuration;
+        //logger.log(`AAC frame, offset/length/total/pts:${offset+headerLength}/${frameLength}/${data.byteLength}/${(stamp/90).toFixed(0)}`);
+        aacSample = {unit: data.subarray(offset + headerLength, offset + headerLength + frameLength), pts: stamp, dts: stamp};
+        track.samples.push(aacSample);
+        track.len += frameLength;
+        offset += frameLength + headerLength;
+        frameIndex++;
         // look for ADTS header (0xFFFx)
-        for ( ; adtsStartOffset < (len - 1); adtsStartOffset++) {
-          if ((data[adtsStartOffset] === 0xff) && ((data[adtsStartOffset + 1] & 0xf0) === 0xf0)) {
+        for ( ; offset < (len - 1); offset++) {
+          if ((data[offset] === 0xff) && ((data[offset + 1] & 0xf0) === 0xf0)) {
             break;
           }
         }
@@ -527,129 +722,14 @@
         break;
       }
     }
-    if (adtsStartOffset < len) {
-      this.aacOverFlow = data.subarray(adtsStartOffset, len);
+    if (offset < len) {
+      aacOverFlow = data.subarray(offset, len);
+      //logger.log(`AAC: overflow detected:${len-offset}`);
     } else {
-      this.aacOverFlow = null;
+      aacOverFlow = null;
     }
-  }
-
-  _ADTStoAudioConfig(data, offset, audioCodec) {
-    var adtsObjectType, // :int
-        adtsSampleingIndex, // :int
-        adtsExtensionSampleingIndex, // :int
-        adtsChanelConfig, // :int
-        config,
-        userAgent = navigator.userAgent.toLowerCase(),
-        adtsSampleingRates = [
-            96000, 88200,
-            64000, 48000,
-            44100, 32000,
-            24000, 22050,
-            16000, 12000,
-            11025, 8000,
-            7350];
-    // byte 2
-    adtsObjectType = ((data[offset + 2] & 0xC0) >>> 6) + 1;
-    adtsSampleingIndex = ((data[offset + 2] & 0x3C) >>> 2);
-    if(adtsSampleingIndex > adtsSampleingRates.length-1) {
-      this.observer.trigger(Event.ERROR, {type: ErrorTypes.MEDIA_ERROR, details: ErrorDetails.FRAG_PARSING_ERROR, fatal: true, reason: `invalid ADTS sampling index:${adtsSampleingIndex}`});
-      return;
-    }
-    adtsChanelConfig = ((data[offset + 2] & 0x01) << 2);
-    // byte 3
-    adtsChanelConfig |= ((data[offset + 3] & 0xC0) >>> 6);
-    logger.log(`manifest codec:${audioCodec},ADTS data:type:${adtsObjectType},sampleingIndex:${adtsSampleingIndex}[${adtsSampleingRates[adtsSampleingIndex]}kHz],channelConfig:${adtsChanelConfig}`);
-    // firefox: freq less than 24kHz = AAC SBR (HE-AAC)
-    if (userAgent.indexOf('firefox') !== -1) {
-      if (adtsSampleingIndex >= 6) {
-        adtsObjectType = 5;
-        config = new Array(4);
-        // HE-AAC uses SBR (Spectral Band Replication) , high frequencies are constructed from low frequencies
-        // there is a factor 2 between frame sample rate and output sample rate
-        // multiply frequency by 2 (see table below, equivalent to substract 3)
-        adtsExtensionSampleingIndex = adtsSampleingIndex - 3;
-      } else {
-        adtsObjectType = 2;
-        config = new Array(2);
-        adtsExtensionSampleingIndex = adtsSampleingIndex;
-      }
-      // Android : always use AAC
-    } else if (userAgent.indexOf('android') !== -1) {
-      adtsObjectType = 2;
-      config = new Array(2);
-      adtsExtensionSampleingIndex = adtsSampleingIndex;
-    } else {
-      /*  for other browsers (chrome ...)
-          always force audio type to be HE-AAC SBR, as some browsers do not support audio codec switch properly (like Chrome ...)
-      */
-      adtsObjectType = 5;
-      config = new Array(4);
-      // if (manifest codec is HE-AAC) OR (manifest codec not specified AND frequency less than 24kHz)
-      if ((audioCodec && audioCodec.indexOf('mp4a.40.5') !== -1) || (!audioCodec && adtsSampleingIndex >= 6)) {
-        // HE-AAC uses SBR (Spectral Band Replication) , high frequencies are constructed from low frequencies
-        // there is a factor 2 between frame sample rate and output sample rate
-        // multiply frequency by 2 (see table below, equivalent to substract 3)
-        adtsExtensionSampleingIndex = adtsSampleingIndex - 3;
-      } else {
-        // if (manifest codec is AAC) AND (frequency less than 24kHz OR nb channel is 1)
-        if (audioCodec && audioCodec.indexOf('mp4a.40.2') !== -1 && (adtsSampleingIndex >= 6 || adtsChanelConfig === 1)) {
-          adtsObjectType = 2;
-          config = new Array(2);
-        }
-        adtsExtensionSampleingIndex = adtsSampleingIndex;
-      }
-    }
-    /* refer to http://wiki.multimedia.cx/index.php?title=MPEG-4_Audio#Audio_Specific_Config
-        ISO 14496-3 (AAC).pdf - Table 1.13 — Syntax of AudioSpecificConfig()
-      Audio Profile / Audio Object Type
-      0: Null
-      1: AAC Main
-      2: AAC LC (Low Complexity)
-      3: AAC SSR (Scalable Sample Rate)
-      4: AAC LTP (Long Term Prediction)
-      5: SBR (Spectral Band Replication)
-      6: AAC Scalable
-     sampling freq
-      0: 96000 Hz
-      1: 88200 Hz
-      2: 64000 Hz
-      3: 48000 Hz
-      4: 44100 Hz
-      5: 32000 Hz
-      6: 24000 Hz
-      7: 22050 Hz
-      8: 16000 Hz
-      9: 12000 Hz
-      10: 11025 Hz
-      11: 8000 Hz
-      12: 7350 Hz
-      13: Reserved
-      14: Reserved
-      15: frequency is written explictly
-      Channel Configurations
-      These are the channel configurations:
-      0: Defined in AOT Specifc Config
-      1: 1 channel: front-center
-      2: 2 channels: front-left, front-right
-    */
-    // audioObjectType = profile => profile, the MPEG-4 Audio Object Type minus 1
-    config[0] = adtsObjectType << 3;
-    // samplingFrequencyIndex
-    config[0] |= (adtsSampleingIndex & 0x0E) >> 1;
-    config[1] |= (adtsSampleingIndex & 0x01) << 7;
-    // channelConfiguration
-    config[1] |= adtsChanelConfig << 3;
-    if (adtsObjectType === 5) {
-      // adtsExtensionSampleingIndex
-      config[1] |= (adtsExtensionSampleingIndex & 0x0E) >> 1;
-      config[2] = (adtsExtensionSampleingIndex & 0x01) << 7;
-      // adtsObjectType (force to 2, chrome is checking that object type is less than 5 ???
-      //    https://chromium.googlesource.com/chromium/src.git/+/master/media/formats/mp4/aac.cc
-      config[2] |= 2 << 2;
-      config[3] = 0;
-    }
-    return {config: config, samplerate: adtsSampleingRates[adtsSampleingIndex], channelCount: adtsChanelConfig, codec: ('mp4a.40.' + adtsObjectType)};
+    this.aacOverFlow = aacOverFlow;
+    this.lastAacPTS = stamp;
   }
 
   _parseID3PES(pes) {

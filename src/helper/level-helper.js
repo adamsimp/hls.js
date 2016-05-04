@@ -44,10 +44,15 @@ class LevelHelper {
     if(PTSFrag) {
       LevelHelper.updateFragPTS(newDetails,PTSFrag.sn,PTSFrag.startPTS,PTSFrag.endPTS);
     } else {
-      // adjust start by sliding offset
-      var sliding = oldfragments[delta].start;
-      for(i = 0 ; i < newfragments.length ; i++) {
-        newfragments[i].start += sliding;
+      // ensure that delta is within oldfragments range
+      // also adjust sliding in case delta is 0 (we could have old=[50-60] and new=old=[50-61])
+      // in that case we also need to adjust start offset of all fragments
+      if (delta >= 0 && delta < oldfragments.length) {
+        // adjust start by sliding offset
+        var sliding = oldfragments[delta].start;
+        for(i = 0 ; i < newfragments.length ; i++) {
+          newfragments[i].start += sliding;
+        }
       }
     }
     // if we are here, it means we have fragments overlapping between
@@ -66,12 +71,12 @@ class LevelHelper {
     fragments = details.fragments;
     frag = fragments[fragIdx];
     if(!isNaN(frag.startPTS)) {
-      startPTS = Math.max(startPTS,frag.startPTS);
-      endPTS = Math.min(endPTS, frag.endPTS);
+      startPTS = Math.min(startPTS,frag.startPTS);
+      endPTS = Math.max(endPTS, frag.endPTS);
     }
-      
+
     var drift = startPTS - frag.start;
-      
+
     frag.start = frag.startPTS = startPTS;
     frag.endPTS = endPTS;
     frag.duration = endPTS - startPTS;
@@ -86,7 +91,7 @@ class LevelHelper {
     }
     details.PTSKnown = true;
     //logger.log(`                                            frag start/end:${startPTS.toFixed(3)}/${endPTS.toFixed(3)}`);
-      
+
     return drift;
   }
 
@@ -99,12 +104,12 @@ class LevelHelper {
       if (toIdx > fromIdx) {
         fragFrom.duration = fragToPTS-fragFrom.start;
         if(fragFrom.duration < 0) {
-          logger.error(`negative duration computed for ${fragFrom}, there should be some duration drift between playlist and fragment!`);
+          logger.error(`negative duration computed for frag ${fragFrom.sn},level ${fragFrom.level}, there should be some duration drift between playlist and fragment!`);
         }
       } else {
         fragTo.duration = fragFrom.start - fragToPTS;
         if(fragTo.duration < 0) {
-          logger.error(`negative duration computed for ${fragTo}, there should be some duration drift between playlist and fragment!`);
+          logger.error(`negative duration computed for frag ${fragTo.sn},level ${fragTo.level}, there should be some duration drift between playlist and fragment!`);
         }
       }
     } else {
